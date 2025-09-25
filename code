@@ -1,0 +1,1293 @@
+import os
+import cv2
+import numpy as np
+import base64
+import time
+import json
+from datetime import datetime
+from flask import Flask, request, jsonify, Response
+from ultralytics import YOLO
+import logging
+import torch
+import threading
+from collections import deque
+import csv
+import traceback
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('VisionApp')
+
+app = Flask(__name__)
+
+# Security headers to enable camera access
+@app.after_request
+def add_csp(response):
+    """Add Content Security Policy headers to allow camera access"""
+    csp = ("default-src 'self'; "
+           "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; "
+           "style-src 'self' 'unsafe-inline'; "
+           "img-src 'self' data:; "
+           "connect-src 'self'; "
+           "media-src 'self' blob:; "
+           "frame-src 'self';")
+    response.headers['Content-Security-Policy'] = csp
+    response.headers['Cross-Origin-Opener-Policy'] = 'same-origin'
+    response.headers['Cross-Origin-Embedder-Policy'] = 'require-corp'
+    return response
+
+# Initialize model
+try:
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logger.info(f"Using device: {device}")
+    model = YOLO('yolov8n.pt').to(device)
+    
+    # Warm up model
+    logger.info("Warming up model...")
+    dummy_input = torch.zeros(1, 3, 640, 640).to(device)
+    model.predict(dummy_input)
+    logger.info("YOLO model loaded and warmed up successfully")
+except Exception as e:
+    logger.error(f"Failed to load YOLO model: {str(e)}")
+    model = None
+
+# Object database (widths in meters)
+OBJECT_WIDTHS = {
+    'person': 0.5, 'car': 1.8, 'truck': 2.5, 'bus': 2.8, 
+    'bicycle': 0.7, 'motorcycle': 0.9, 'cat': 0.3, 'dog': 0.4,
+    'chair': 0.5, 'sofa': 1.2, 'potted plant': 0.4, 'bed': 1.5,
+    'dining table': 1.0, 'toilet': 0.7, 'tv': 1.0, 'laptop': 0.4,
+    'default_large': 1.5, 'default_medium': 0.7, 'default_small': 0.2
+}
+
+# Language support - FULLY TRANSLATED
+LANGUAGES = {
+    "en": {
+        "environment_clear": "Environment clear",
+        "warning_close": "Warning! {object} is very close ({distance}m)",
+        "object_moving": "{object} is moving {direction}",
+        "objects_detected": "Objects detected: {objects}",
+        "system_ready": "System ready...",
+        "voice_enabled": "Voice guidance enabled",
+        "voice_disabled": "Voice guidance disabled",
+        "camera_denied": "Camera access denied. Please enable permissions.",
+        "processing_error": "Processing error occurred",
+        "close_objects": "Close objects: {objects}",
+        "history": "Detection History",
+        "time": "Time",
+        "object": "Object",
+        "distance": "Distance",
+        "direction": "Direction",
+        "movement": "Movement",
+        "status": "Status",
+        "start_camera": "Start Camera",
+        "stop_camera": "Stop Camera",
+        "enable_voice": "Enable Voice",
+        "disable_voice": "Disable Voice",
+        "save_history": "Save History",
+        "history_saved": "History saved to file",
+        "clear_history": "Clear History",
+        "object_too_close": "Object too close",
+        "camera_permission_denied": "Camera permission denied. Please enable in browser settings.",
+        "camera_not_found": "No camera found. Please connect a camera.",
+        "camera_help_title": "Camera Access Help",
+        "camera_help_step1": "1. Look for a camera icon in your browser's address bar",
+        "camera_help_step2": "2. Click it and select 'Allow' or 'Always allow'",
+        "camera_help_step3": "3. Refresh this page and try again",
+        "retry_camera": "Try Again"
+    },
+    "es": {
+        "environment_clear": "Entorno claro",
+        "warning_close": "¡Advertencia! {object} está muy cerca ({distance}m)",
+        "object_moving": "{object} se está moviendo {direction}",
+        "objects_detected": "Objetos detectados: {objects}",
+        "system_ready": "Sistema listo...",
+        "voice_enabled": "Guía de voz habilitada",
+        "voice_disabled": "Guía de voz deshabilitada",
+        "camera_denied": "Acceso a cámara denegado. Por favor habilite permisos.",
+        "processing_error": "Ocurrió un error de procesamiento",
+        "close_objects": "Objetos cercanos: {objects}",
+        "history": "Historial de detecciones",
+        "time": "Hora",
+        "object": "Objeto",
+        "distance": "Distancia",
+        "direction": "Dirección",
+        "movement": "Movimiento",
+        "status": "Estado",
+        "start_camera": "Iniciar cámara",
+        "stop_camera": "Detener cámara",
+        "enable_voice": "Habilitar voz",
+        "disable_voice": "Deshabilitar voz",
+        "save_history": "Guardar historial",
+        "history_saved": "Historial guardado",
+        "clear_history": "Borrar historial",
+        "object_too_close": "Objeto demasiado cerca",
+        "camera_permission_denied": "Permiso de cámara denegado. Por favor habilite en configuraciones del navegador.",
+        "camera_not_found": "No se encontró cámara. Por favor conecte una cámara.",
+        "camera_help_title": "Ayuda de Acceso a Cámara",
+        "camera_help_step1": "1. Busque un ícono de cámara en la barra de direcciones",
+        "camera_help_step2": "2. Haga clic y seleccione 'Permitir' o 'Permitir siempre'",
+        "camera_help_step3": "3. Actualice esta página e intente nuevamente",
+        "retry_camera": "Intentar de Nuevo"
+    },
+    "fr": {
+        "environment_clear": "Environnement clair",
+        "warning_close": "Attention ! {object} est très proche ({distance}m)",
+        "object_moving": "{object} se déplace {direction}",
+        "objects_detected": "Objets détectés: {objects}",
+        "system_ready": "Système prêt...",
+        "voice_enabled": "Guidage vocal activé",
+        "voice_disabled": "Guidage vocal désactivé",
+        "camera_denied": "Accès à la caméra refusé. Veuillez activer les permissions.",
+        "processing_error": "Une erreur de traitement s'est produite",
+        "close_objects": "Objets proches: {objects}",
+        "history": "Historique de détection",
+        "time": "Heure",
+        "object": "Objet",
+        "distance": "Distance",
+        "direction": "Direction",
+        "movement": "Mouvement",
+        "status": "Statut",
+        "start_camera": "Démarrer la caméra",
+        "stop_camera": "Arrêter la caméra",
+        "enable_voice": "Activer la voix",
+        "disable_voice": "Désactiver la voix",
+        "save_history": "Sauvegarder l'historique",
+        "history_saved": "Historique sauvegardé",
+        "clear_history": "Effacer l'historique",
+        "object_too_close": "Objet trop proche",
+        "camera_permission_denied": "Autorisation de la caméra refusée. Veuillez activer dans les paramètres du navigateur.",
+        "camera_not_found": "Aucune caméra trouvée. Veuillez connecter une caméra.",
+        "camera_help_title": "Aide d'accès à la caméra",
+        "camera_help_step1": "1. Cherchez une icône de caméra dans la barre d'adresse",
+        "camera_help_step2": "2. Cliquez dessus et sélectionnez 'Autoriser' ou 'Toujours autoriser'",
+        "camera_help_step3": "3. Actualisez cette page et réessayez",
+        "retry_camera": "Réessayer"
+    }
+}
+
+# System state
+fps_counter = []
+known_objects = {}
+detection_history = deque(maxlen=100)  # Store last 100 detections
+processing_lock = threading.Lock()
+prev_detections = {}  # For movement tracking
+audio_queue = deque(maxlen=5)  # Audio priority queue
+current_audio = None
+last_audio_time = 0
+HISTORY_FILE = "detection_history.csv"
+MIN_DISTANCE_THRESHOLD = 0.3  # Minimum valid distance in meters
+
+# Error codes
+ERROR_CODES = {
+    "IMAGE_MISSING": 100,
+    "IMAGE_TOO_LARGE": 101,
+    "INVALID_IMAGE": 102,
+    "MODEL_FAILED": 103,
+    "DISTANCE_FAILED": 104,
+    "OBJECT_TOO_CLOSE": 105,
+    "GENERAL_ERROR": 200
+}
+
+# Security settings
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
+
+# Initialize history file
+if not os.path.exists(HISTORY_FILE):
+    with open(HISTORY_FILE, "w", newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        # Corrected column headers to match data being appended
+        writer.writerow(["Timestamp", "Object", "Distance", "Direction", "Movement", "Too Close"])
+
+def estimate_distance(pixel_width, object_type, frame_width=640):
+    try:
+        # Validate inputs
+        if pixel_width <= 0 or frame_width <= 0:
+            raise ValueError("Invalid dimensions for distance calculation")
+            
+        obj_width = OBJECT_WIDTHS.get(object_type)
+        if not obj_width:
+            size_ratio = pixel_width / frame_width
+            if size_ratio > 0.3:  # Large objects
+                obj_width = OBJECT_WIDTHS.get('default_large', 1.0)
+            elif size_ratio > 0.1:  # Medium objects
+                obj_width = OBJECT_WIDTHS.get('default_medium', 0.5)
+            else:  # Small objects
+                obj_width = OBJECT_WIDTHS.get('default_small', 0.1)
+        
+        distance = (obj_width * frame_width) / (pixel_width + 1e-5)
+        return max(MIN_DISTANCE_THRESHOLD, min(100.0, distance))
+    except Exception as e:
+        logger.error(f"Distance estimation error: {str(e)}")
+        return MIN_DISTANCE_THRESHOLD  # Return safe minimum distance
+
+def detect_movement(current_id, current_center, timestamp):
+    """Detect if an object is moving based on position changes"""
+    if current_id not in prev_detections:
+        prev_detections[current_id] = {
+            'position': current_center,
+            'timestamp': timestamp,
+            'last_moved': timestamp
+        }
+        return "stationary"
+    
+    prev = prev_detections[current_id]
+    time_diff = timestamp - prev['timestamp']
+    
+    # Only check if enough time has passed
+    if time_diff < 0.1:  # 100ms
+        return prev.get('status', 'stationary')
+    
+    distance = np.sqrt((current_center[0] - prev['position'][0])**2 + 
+                       (current_center[1] - prev['position'][1])**2)
+    
+    # Update position
+    prev_detections[current_id] = {
+        'position': current_center,
+        'timestamp': timestamp,
+        'last_moved': prev['last_moved']
+    }
+    
+    # Calculate speed (pixels per second)
+    speed = distance / time_diff if time_diff > 0 else 0
+    
+    # Determine movement status
+    if speed > 20:  # Moving threshold (20 pixels/sec)
+        prev_detections[current_id]['last_moved'] = timestamp
+        return "moving"
+    elif timestamp - prev['last_moved'] < 1.0:  # Was moving in last 1 sec
+        return "recently moved"
+    return "stationary"
+
+def generate_audio_description(detections, language="en"):
+    """Generate voice description text for detections"""
+    lang_dict = LANGUAGES.get(language, LANGUAGES["en"])
+    
+    if not detections:
+        return lang_dict["environment_clear"]
+    
+    # Priority: close objects > moving objects > stationary objects
+    close_objects = []
+    moving_objects = []
+    other_objects = []
+    
+    for det in detections:
+        # Only alert for close objects
+        if det['distance'] < 1.0:
+            close_objects.append(lang_dict["warning_close"].format(
+                object=det['label'], 
+                distance=det['distance']
+            ))
+        elif det['movement'] == 'moving':
+            moving_objects.append(lang_dict["object_moving"].format(
+                object=det['label'],
+                direction=det['direction']
+            ))
+        else:
+            other_objects.append(det['label'])
+    
+    # Build description
+    if close_objects:
+        return ". ".join(close_objects)
+    elif moving_objects:
+        return ". ".join(moving_objects)
+    elif other_objects:
+        # Mention the top 3 most frequent objects
+        common_objects = {}
+        for obj in other_objects:
+            common_objects[obj] = common_objects.get(obj, 0) + 1
+        top_objects = sorted(common_objects.items(), key=lambda x: x[1], reverse=True)[:3]
+        obj_list = ", ".join([obj[0] for obj in top_objects])
+        return lang_dict["objects_detected"].format(objects=obj_list)
+    
+    return lang_dict["environment_clear"]
+
+def speak_alert(text):
+    """Threaded function to speak alerts"""
+    global current_audio
+    try:
+        # Basic implementation - would be replaced with actual TTS
+        print(f"SPEAKING: {text}")
+    except Exception as e:
+        logger.error(f"Audio error: {str(e)}")
+    finally:
+        current_audio = None
+
+def play_audio(text):
+    """Manage audio playback with priority queue"""
+    global current_audio, last_audio_time
+    
+    # Don't play duplicate alerts
+    if audio_queue and text == audio_queue[-1]:
+        return
+    
+    # Add to queue
+    if "Warning" in text or "Advertencia" in text or "Attention" in text:
+        audio_queue.appendleft(text)  # High priority
+    else:
+        audio_queue.append(text)  # Normal priority
+    
+    # Play next if nothing is playing
+    current_time = time.time()
+    if not current_audio and audio_queue and (current_time - last_audio_time > 1.0):
+        current_audio = audio_queue.popleft()
+        last_audio_time = current_time
+        threading.Thread(target=speak_alert, args=(current_audio,)).start()
+
+def save_history_to_csv():
+    """Save detection history to CSV file"""
+    try:
+        # Create directory if needed
+        os.makedirs(os.path.dirname(os.path.abspath(HISTORY_FILE)), exist_ok=True)
+        
+        # Create file if it doesn't exist
+        file_exists = os.path.exists(HISTORY_FILE)
+        
+        with open(HISTORY_FILE, "a", newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["Timestamp", "Object", "Distance", "Direction", "Movement", "Too Close"])
+            
+            for entry in detection_history:
+                writer.writerow([
+                    entry['time'],
+                    entry['object'],
+                    entry['distance'],
+                    entry['direction'],
+                    entry['movement'],
+                    "Yes" if entry.get('too_close', False) else "No"
+                ])
+        return True
+    except PermissionError as e:
+        logger.error(f"Permission denied for history file: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to save history: {str(e)}\n{traceback.format_exc()}")
+        return False
+
+@app.route('/process', methods=['POST'])
+def process_frame():
+    start_time = time.time()
+    try:
+        data = request.json
+        if not data or 'image' not in data:
+            return jsonify({
+                "error": "Missing image data",
+                "code": ERROR_CODES["IMAGE_MISSING"]
+            }), 400
+            
+        image_data = data['image']
+        language = data.get('language', 'en')
+        frame_width = data.get('width', 640)
+        
+        # Security checks
+        if len(image_data) > MAX_IMAGE_SIZE:
+            return jsonify({
+                "error": "Image too large",
+                "code": ERROR_CODES["IMAGE_TOO_LARGE"]
+            }), 400
+            
+        # Validate image format
+        if not image_data.startswith('data:image/'):
+            return jsonify({
+                "error": "Invalid image format",
+                "code": ERROR_CODES["INVALID_IMAGE"]
+            }), 400
+        
+        # Extract base64 string
+        header, encoded = image_data.split(",", 1) if "," in image_data else ("", image_data)
+        
+        # Convert to image
+        nparr = np.frombuffer(base64.b64decode(encoded), np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            return jsonify({
+                "error": "Failed to decode image",
+                "code": ERROR_CODES["INVALID_IMAGE"]
+            }), 400
+        
+        # Process frame
+        if model is None:
+            return jsonify({
+                "error": "Model not loaded",
+                "code": ERROR_CODES["MODEL_FAILED"]
+            }), 500
+            
+        try:
+            with processing_lock:
+                results = model.predict(frame, conf=0.4, verbose=False, imgsz=640)[0]
+        except Exception as e:
+            return jsonify({
+                "error": f"Prediction failed: {str(e)}",
+                "code": ERROR_CODES["MODEL_FAILED"]
+            }), 500
+        
+        detections = []
+        timestamp = time.time()
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            label = model.names[int(box.cls)]
+            pixel_width = x2 - x1
+            
+            # Skip small/unreliable detections
+            if pixel_width < 15 or box.conf < 0.4:
+                continue
+                
+            try:
+                distance = estimate_distance(pixel_width, label, frame_width)
+            except Exception as e:
+                logger.error(f"Distance error: {str(e)}")
+                distance = MIN_DISTANCE_THRESHOLD
+                
+            # Handle object-too-close scenario
+            too_close = False
+            if distance <= MIN_DISTANCE_THRESHOLD:
+                logger.warning(f"Object too close: {label} at {distance:.2f}m")
+                too_close = True
+                
+            # Determine direction
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+            if center_x < frame_width * 0.33:
+                direction = "left"
+            elif center_x > frame_width * 0.66:
+                direction = "right"
+            else:
+                direction = "center"
+                
+            # Create object ID for tracking
+            obj_id = f"{label}-{center_x//50}-{center_y//50}"
+            
+            # Detect movement
+            movement = detect_movement(obj_id, (center_x, center_y), timestamp)
+            
+            detection = {
+                "id": obj_id,
+                "label": label,
+                "distance": round(distance, 1),
+                "direction": direction,
+                "bbox": [x1, y1, x2, y2],
+                "confidence": round(float(box.conf), 2),
+                "movement": movement,
+                "timestamp": timestamp,
+                "too_close": too_close
+            }
+            detections.append(detection)
+            
+            # Add to history
+            detection_history.append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "object": label,
+                "distance": round(distance, 1),
+                "direction": direction,
+                "movement": movement,
+                "position": [center_x, center_y],
+                "too_close": too_close
+            })
+        
+        # Generate audio description
+        audio_text = generate_audio_description(detections, language)
+        
+        # Add to audio queue
+        play_audio(audio_text)
+        
+        # Calculate FPS
+        fps_counter.append(time.time())
+        fps_counter[:] = fps_counter[-10:]  # Keep last 10 samples
+        fps = len(fps_counter) / (fps_counter[-1] - fps_counter[0]) if len(fps_counter) > 1 else 0
+        
+        return jsonify({
+            "detections": detections,
+            "audio_text": audio_text,
+            "fps": round(fps, 1),
+            "timestamp": timestamp
+        })
+        
+    except Exception as e:
+        logger.error(f"Processing error: {str(e)}\n{traceback.format_exc()}")
+        return jsonify({
+            "error": str(e),
+            "code": ERROR_CODES["GENERAL_ERROR"]
+        }), 500
+
+@app.route('/history', methods=['GET'])
+def get_detection_history():
+    """Return detection history"""
+    return jsonify(list(detection_history))
+
+@app.route('/save_history', methods=['POST'])
+def save_history():
+    """Save current history to file"""
+    if save_history_to_csv():
+        return jsonify({"status": "success", "message": "History saved to file", "filename": HISTORY_FILE})
+    return jsonify({"status": "error", "message": "Failed to save history"}), 500
+
+@app.route('/clear_history', methods=['POST'])
+def clear_history():
+    """Clear current detection history"""
+    detection_history.clear()
+    return jsonify({"status": "success", "message": "History cleared"})
+
+@app.route('/download_history', methods=['GET'])
+def download_history():
+    """Download history file"""
+    return Response(
+        open(HISTORY_FILE, "rb"),
+        mimetype="text/csv",
+        headers={"Content-disposition": f"attachment; filename={HISTORY_FILE}"}
+    )
+
+@app.route('/languages', methods=['GET'])
+def get_languages():
+    """Return available languages"""
+    return jsonify(list(LANGUAGES.keys()))
+
+@app.route('/system', methods=['GET'])
+def system_status():
+    """Return system status information"""
+    import psutil
+    return jsonify({
+        "cpu": psutil.cpu_percent(),
+        "memory": psutil.virtual_memory().percent,
+        "gpu": "N/A",  # Placeholder for GPU monitoring
+        "audio_queue": len(audio_queue),
+        "detections": len(prev_detections)
+    })
+
+@app.route('/')
+def home():
+    """Serve the enhanced HTML interface"""
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Vision - Real-Time Visual Assistance</title>
+        <link href="tailwind.css" rel="stylesheet">
+        <style>
+            body {
+                font-family: 'Segoe UI', system-ui, sans-serif;
+            }
+            .camera-container {
+                position: relative;
+                width: 640px;
+                height: 480px;
+                background: #1a202c;
+                border-radius: 8px;
+                overflow: hidden;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            }
+            #processingCanvas {
+                position: absolute;
+                top: 0;
+                left: 0;
+            }
+            .status-indicator {
+                position: absolute;
+                top: 10px;
+                left: 10px;
+                background: red;
+                color: white;
+                padding: 5px 10px;
+                border-radius: 20px;
+                font-size: 14px;
+                z-index: 10;
+            }
+            .blink-warning {
+                animation: blink 1s infinite;
+            }
+            @keyframes blink {
+                50% { opacity: 0.3; }
+            }
+            .history-table {
+                width: 100%;
+                border-collapse: collapse;
+            }
+            .history-table th, .history-table td {
+                border: 1px solid #374151;
+                padding: 8px;
+                text-align: left;
+                font-size: 14px;
+            }
+            .history-table th {
+                background-color: #1f2937;
+            }
+            .warning-border {
+                animation: border-blink 1s infinite;
+            }
+            @keyframes border-blink {
+                0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+                70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+                100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+            }
+            /* Ensure buttons are visible */
+            .action-button {
+                display: block;
+                width: 100%;
+                margin-bottom: 10px;
+            }
+        </style>
+    </head>
+    <body class="bg-gray-900 text-white">
+        <nav class="bg-indigo-900 py-4">
+            <div class="container mx-auto px-4 flex justify-between items-center">
+                <h1 class="text-2xl font-bold">VISION - Real-Time Visual Assistance</h1>
+                <div class="flex space-x-6 items-center">
+                    <div class="flex items-center">
+                        <span class="mr-2">Language:</span>
+                        <select id="languageSelect" class="bg-gray-800 text-white px-2 py-1 rounded">
+                            <option value="en">English</option>
+                            <option value="es">Español</option>
+                            <option value="fr">Français</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </nav>
+
+        <section class="py-8">
+            <div class="container mx-auto px-4">
+                <div class="flex flex-col lg:flex-row items-start justify-between gap-8">
+                    <div class="w-full lg:w-1/2">
+                        <div class="camera-container mb-6 relative" id="cameraContainer">
+                            <div class="status-indicator" id="statusIndicator">Camera Off</div>
+                            <video id="liveFeed" autoplay playsinline class="hidden"></video>
+                            <canvas id="processingCanvas" width="640" height="480"></canvas>
+                        </div>
+                        
+                        <div class="p-4 bg-gray-800 rounded-lg">
+                            <h4 class="font-medium mb-2">Detection Output</h4>
+                            <div id="audioOutput" class="text-indigo-300 italic min-h-[60px]">System ready...</div>
+                            <div class="flex flex-col space-y-4 mt-4">
+                                <button id="startCamera" class="bg-green-600 hover:bg-green-500 px-4 py-2 rounded text-white font-bold">
+                                    Start Camera
+                                </button>
+                                <button id="voiceBtn" class="bg-indigo-700 hover:bg-indigo-600 px-4 py-2 rounded text-white font-bold">
+                                    Enable Voice
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="w-full lg:w-1/2">
+                        <div class="bg-gray-800 p-6 rounded-lg mb-6">
+                            <div class="flex justify-between items-center mb-4">
+                                <h3 class="text-xl font-semibold">Detection History</h3>
+                                <div class="flex space-x-2">
+                                    <button id="saveHistory" class="bg-blue-600 hover:bg-blue-500 px-3 py-1 rounded text-sm text-white">
+                                        Save History
+                                    </button>
+                                    <button id="downloadHistory" class="bg-green-600 hover:bg-green-500 px-3 py-1 rounded text-sm text-white">
+                                        Download
+                                    </button>
+                                    <button id="clearHistory" class="bg-red-600 hover:bg-red-500 px-3 py-1 rounded text-sm text-white">
+                                        Clear
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="overflow-x-auto max-h-80">
+                                <table class="history-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Time</th>
+                                            <th>Object</th>
+                                            <th>Distance</th>
+                                            <th>Direction</th>
+                                            <th>Movement</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="historyBody">
+                                        <tr><td colspan="5" class="text-center py-4">No detections yet</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        
+                        <div class="bg-gray-800 p-6 rounded-lg">
+                            <h3 class="text-xl font-semibold mb-4">System Information</h3>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <h4 class="text-gray-400">Current Status</h4>
+                                    <p id="sysStatus">Idle</p>
+                                </div>
+                                <div>
+                                    <h4 class="text-gray-400">Processing FPS</h4>
+                                    <p id="sysFPS">0.0</p>
+                                </div>
+                                <div>
+                                    <h4 class="text-gray-400">Objects Tracked</h4>
+                                    <p id="sysObjects">0</p>
+                                </div>
+                                <div>
+                                    <h4 class="text-gray-400">Active Alerts</h4>
+                                    <p id="sysAlerts">0</p>
+                                </div>
+                                <div>
+                                    <h4 class="text-gray-400">CPU Usage</h4>
+                                    <p id="sysCPU">0%</p>
+                                </div>
+                                <div>
+                                    <h4 class="text-gray-400">Memory Usage</h4>
+                                    <p id="sysMem">0%</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <script>
+            // DOM Elements
+            const video = document.getElementById('liveFeed');
+            const canvas = document.getElementById('processingCanvas');
+            const ctx = canvas.getContext('2d');
+            const startBtn = document.getElementById('startCamera');
+            const voiceBtn = document.getElementById('voiceBtn');
+            const audioOutput = document.getElementById('audioOutput');
+            const statusIndicator = document.getElementById('statusIndicator');
+            const languageSelect = document.getElementById('languageSelect');
+            const historyBody = document.getElementById('historyBody');
+            const sysStatus = document.getElementById('sysStatus');
+            const sysFPS = document.getElementById('sysFPS');
+            const sysObjects = document.getElementById('sysObjects');
+            const sysAlerts = document.getElementById('sysAlerts');
+            const sysCPU = document.getElementById('sysCPU');
+            const sysMem = document.getElementById('sysMem');
+            const saveHistoryBtn = document.getElementById('saveHistory');
+            const downloadHistoryBtn = document.getElementById('downloadHistory');
+            const clearHistoryBtn = document.getElementById('clearHistory');
+            const cameraContainer = document.getElementById('cameraContainer');
+
+            // State
+            let voiceEnabled = false;
+            let cameraActive = false;
+            let stream = null;
+            let processingInterval = null;
+            const API_URL = '/process';
+            const HISTORY_URL = '/history';
+            const SYSTEM_URL = '/system';
+            const SAVE_HISTORY_URL = '/save_history';
+            const DOWNLOAD_HISTORY_URL = '/download_history';
+            const CLEAR_HISTORY_URL = '/clear_history';
+            const LANGUAGES_URL = '/languages';
+            let currentLanguage = 'en';
+            let lastAudioTime = 0;
+            const AUDIO_COOLDOWN = 3000; // 3 seconds
+            let closeAlerts = 0;
+            let movementAlerts = 0;
+
+            // Initialize
+            function init() {
+                startBtn.addEventListener('click', toggleCamera);
+                voiceBtn.addEventListener('click', toggleVoice);
+                languageSelect.addEventListener('change', updateLanguage);
+                saveHistoryBtn.addEventListener('click', saveHistory);
+                downloadHistoryBtn.addEventListener('click', downloadHistory);
+                clearHistoryBtn.addEventListener('click', clearHistory);
+                
+                // Load language preference
+                const savedLang = localStorage.getItem('vision_language');
+                if (savedLang) {
+                    currentLanguage = savedLang;
+                    languageSelect.value = savedLang;
+                }
+                
+                // Draw initial canvas
+                drawInitialCanvas();
+                fetchDetectionHistory();
+                
+                // Start system monitoring
+                setInterval(updateSystemStats, 2000);
+            }
+
+            function drawInitialCanvas() {
+                ctx.fillStyle = '#1a202c';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#4F46E5';
+                ctx.font = '24px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText('Click "Start Camera" to begin', canvas.width/2, canvas.height/2);
+            }
+
+            // Update language
+            function updateLanguage() {
+                currentLanguage = languageSelect.value;
+                localStorage.setItem('vision_language', currentLanguage);
+                
+                // Update UI text
+                startBtn.textContent = cameraActive ? 
+                    translations[currentLanguage]['stop_camera'] : 
+                    translations[currentLanguage]['start_camera'];
+                
+                voiceBtn.textContent = voiceEnabled ? 
+                    translations[currentLanguage]['disable_voice'] : 
+                    translations[currentLanguage]['enable_voice'];
+                
+                statusIndicator.textContent = cameraActive ? 
+                    `${translations[currentLanguage]['status']}: Active` : 
+                    `${translations[currentLanguage]['status']}: Off`;
+            }
+            
+            // Translations for frontend
+            const translations = {
+                "en": {
+                    "start_camera": "Start Camera",
+                    "stop_camera": "Stop Camera",
+                    "enable_voice": "Enable Voice",
+                    "disable_voice": "Disable Voice",
+                    "status": "Status",
+                    "save_history": "Save History",
+                    "history_saved": "History saved to file",
+                    "clear_history": "Clear History",
+                    "environment_clear": "Environment clear",
+                    "camera_denied": "Camera access denied",
+                    "processing_error": "Processing error",
+                    "voice_enabled": "Voice enabled",
+                    "voice_disabled": "Voice disabled",
+                    "object_too_close": "Object too close",
+                    "camera_permission_denied": "Camera permission denied. Please enable in browser settings.",
+                    "camera_not_found": "No camera found. Please connect a camera.",
+                    "camera_help_title": "Camera Access Help",
+                    "camera_help_step1": "1. Look for a camera icon in your browser's address bar",
+                    "camera_help_step2": "2. Click it and select 'Allow' or 'Always allow'",
+                    "camera_help_step3": "3. Refresh this page and try again",
+                    "retry_camera": "Try Again"
+                },
+                "es": {
+                    "start_camera": "Iniciar cámara",
+                    "stop_camera": "Detener cámara",
+                    "enable_voice": "Habilitar voz",
+                    "disable_voice": "Deshabilitar voz",
+                    "status": "Estado",
+                    "save_history": "Guardar historial",
+                    "history_saved": "Historial guardado",
+                    "clear_history": "Borrar historial",
+                    "environment_clear": "Entorno claro",
+                    "camera_denied": "Acceso a cámara denegado",
+                    "processing_error": "Error de procesamiento",
+                    "voice_enabled": "Voz habilitada",
+                    "voice_disabled": "Voz deshabilitada",
+                    "object_too_close": "Objeto demasiado cerca",
+                    "camera_permission_denied": "Permiso de cámara denegado. Por favor habilite en configuraciones del navegador.",
+                    "camera_not_found": "No se encontró cámara. Por favor conecte una cámara.",
+                    "camera_help_title": "Ayuda de Acceso a Cámara",
+                    "camera_help_step1": "1. Busque un ícono de cámara en la barra de direcciones",
+                    "camera_help_step2": "2. Haga clic y seleccione 'Permitir' o 'Permitir siempre'",
+                    "camera_help_step3": "3. Actualice esta página e intente nuevamente",
+                    "retry_camera": "Intentar de Nuevo"
+                },
+                "fr": {
+                    "start_camera": "Démarrer la caméra",
+                    "stop_camera": "Arrêter la caméra",
+                    "enable_voice": "Activer la voix",
+                    "disable_voice": "Désactiver la voix",
+                    "status": "Statut",
+                    "save_history": "Sauvegarder l'historique",
+                    "history_saved": "Historique sauvegardé",
+                    "clear_history": "Effacer l'historique",
+                    "environment_clear": "Environnement clair",
+                    "camera_denied": "Accès à la caméra refusé",
+                    "processing_error": "Erreur de traitement",
+                    "voice_enabled": "Voix activée",
+                    "voice_disabled": "Voix désactivée",
+                    "object_too_close": "Objet trop proche",
+                    "camera_permission_denied": "Autorisation de la caméra refusée. Veuillez activer dans les paramètres du navigateur.",
+                    "camera_not_found": "Aucune caméra trouvée. Veuillez connecter une caméra.",
+                    "camera_help_title": "Aide d'accès à la caméra",
+                    "camera_help_step1": "1. Cherchez une icône de caméra dans la barre d'adresse",
+                    "camera_help_step2": "2. Cliquez dessus et sélectionnez 'Autoriser' ou 'Toujours autoriser'",
+                    "camera_help_step3": "3. Actualisez cette page et réessayez",
+                    "retry_camera": "Réessayer"
+                }
+            };
+
+            function getTranslation(key) {
+                return translations[currentLanguage][key] || key;
+            }
+
+            // Toggle camera
+            async function toggleCamera() {
+                if (cameraActive) {
+                    stopCamera();
+                } else {
+                    await startCamera();
+                }
+                updateLanguage();
+            }
+
+            // Start camera
+            async function startCamera() {
+                try {
+                    // First check permissions
+                    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                        throw new Error("Camera API not supported in this browser");
+                    }
+                    
+                    // Try environment-facing camera first
+                    try {
+                        stream = await navigator.mediaDevices.getUserMedia({ 
+                            video: { facingMode: 'environment' } 
+                        });
+                    } catch (envError) {
+                        console.log('Environment camera failed, trying user-facing:', envError);
+                        // Fallback to user-facing camera
+                        stream = await navigator.mediaDevices.getUserMedia({ 
+                            video: true 
+                        });
+                    }
+                    
+                    video.srcObject = stream;
+                    cameraActive = true;
+                    
+                    // Update UI
+                    startBtn.textContent = getTranslation('stop_camera');
+                    startBtn.classList.replace('bg-green-600', 'bg-red-600');
+                    statusIndicator.textContent = `${getTranslation('status')}: Active`;
+                    statusIndicator.style.background = 'green';
+                    sysStatus.textContent = 'Active';
+                    
+                    // Start processing
+                    startProcessing();
+                } catch (err) {
+                    console.error('Camera error:', err);
+                    handleCameraError(err);
+                }
+            }
+
+            function handleCameraError(err) {
+                let errorMessage = getTranslation('camera_denied');
+                
+                if (err.name === 'NotAllowedError') {
+                    errorMessage = getTranslation('camera_permission_denied');
+                } else if (err.name === 'NotFoundError') {
+                    errorMessage = getTranslation('camera_not_found');
+                }
+                
+                audioOutput.textContent = errorMessage;
+                speakAlert(errorMessage);
+                showPermissionHelp();
+            }
+
+            function showPermissionHelp() {
+                // Create help message
+                const helpMessage = `
+                    <div class="bg-yellow-900 p-4 rounded-lg mt-4">
+                        <h4 class="font-bold text-yellow-300">${getTranslation('camera_help_title')}</h4>
+                        <p>${getTranslation('camera_help_step1')}</p>
+                        <p>${getTranslation('camera_help_step2')}</p>
+                        <p>${getTranslation('camera_help_step3')}</p>
+                        <button id="retryCamera" class="mt-2 bg-blue-600 hover:bg-blue-500 px-3 py-1 rounded text-white">
+                            ${getTranslation('retry_camera')}
+                        </button>
+                    </div>
+                `;
+                
+                // Insert after camera container
+                cameraContainer.insertAdjacentHTML('afterend', helpMessage);
+                
+                // Add retry handler
+                document.getElementById('retryCamera').addEventListener('click', () => {
+                    document.querySelector('.bg-yellow-900').remove();
+                    startCamera();
+                });
+            }
+
+            // Stop camera
+            function stopCamera() {
+                if (stream) {
+                    stream.getTracks().forEach(track => track.stop());
+                }
+                cameraActive = false;
+                clearInterval(processingInterval);
+                
+                // Update UI
+                startBtn.textContent = getTranslation('start_camera');
+                startBtn.classList.replace('bg-red-600', 'bg-green-600');
+                statusIndicator.textContent = `${getTranslation('status')}: Off`;
+                statusIndicator.style.background = 'red';
+                sysStatus.textContent = 'Idle';
+                sysFPS.textContent = '0.0';
+                sysObjects.textContent = '0';
+                sysAlerts.textContent = '0';
+                
+                // Clear canvas
+                drawInitialCanvas();
+            }
+
+            // Toggle voice
+            function toggleVoice() {
+                voiceEnabled = !voiceEnabled;
+                voiceBtn.textContent = voiceEnabled ? 
+                    getTranslation('disable_voice') : 
+                    getTranslation('enable_voice');
+                voiceBtn.classList.toggle('bg-green-600', voiceEnabled);
+                
+                if (voiceEnabled) {
+                    speakAlert(getTranslation('voice_enabled'));
+                } else {
+                    speakAlert(getTranslation('voice_disabled'));
+                }
+                updateLanguage();
+            }
+
+            // Start processing frames
+            function startProcessing() {
+                if (processingInterval) clearInterval(processingInterval);
+                processingInterval = setInterval(processFrame, 300); // Process every 300ms
+            }
+
+            // Process a single frame
+            async function processFrame() {
+                // Draw video frame to canvas
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                
+                // Get image data
+                const imageData = canvas.toDataURL('image/jpeg');
+                
+                try {
+                    // Send to backend API
+                    const response = await fetch(API_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ 
+                            image: imageData,
+                            language: currentLanguage,
+                            width: canvas.width
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(errorData.error || 'Server error');
+                    }
+                    
+                    const data = await response.json();
+                    
+                    // Draw detections
+                    drawDetections(data.detections);
+                    
+                    // Update UI
+                    updateDetectionUI(data);
+                    
+                    // Play audio if enabled and available
+                    playAudioAlert(data);
+                    
+                    // Update system info
+                    sysFPS.textContent = data.fps.toFixed(1);
+                    sysObjects.textContent = data.detections.length;
+                    
+                    // Count alerts
+                    closeAlerts = data.detections.filter(d => d.distance < 1.0).length;
+                    movementAlerts = data.detections.filter(d => d.movement === 'moving').length;
+                    sysAlerts.textContent = closeAlerts + movementAlerts;
+                    
+                    // Handle too close warning
+                    handleTooCloseWarning(data.detections);
+                    
+                    // Update history
+                    fetchDetectionHistory();
+                } catch (err) {
+                    console.error('API error:', err);
+                    audioOutput.textContent = getTranslation('processing_error') + ': ' + err.message;
+                    speakAlert(getTranslation('processing_error'));
+                }
+            }
+
+            // Draw detections on canvas
+            function drawDetections(detections) {
+                // Clear previous drawings
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                
+                detections.forEach(det => {
+                    const [x1, y1, x2, y2] = det.bbox;
+                    const width = x2 - x1;
+                    const height = y2 - y1;
+                    
+                    // Set style based on distance and movement
+                    if (det.too_close) {
+                        // Draw warning highlight for close objects
+                        ctx.fillStyle = 'rgba(239, 68, 68, 0.3)';
+                        ctx.fillRect(x1, y1, width, height);
+                        ctx.strokeStyle = '#EF4444';
+                        ctx.lineWidth = 3;
+                        ctx.strokeRect(x1, y1, width, height);
+                    } else {
+                        ctx.strokeStyle = det.movement === 'moving' ? '#F97316' : '#10B981';
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(x1, y1, width, height);
+                    }
+                    
+                    // Draw label
+                    ctx.fillStyle = ctx.strokeStyle;
+                    ctx.font = 'bold 14px Arial';
+                    ctx.fillText(`${det.label} ${det.distance}m (${det.direction})`, x1, y1 - 5);
+                    
+                    // Draw movement indicator
+                    if (det.movement === 'moving') {
+                        ctx.fillText('→', x1 + width - 15, y1 - 5);
+                    }
+                    
+                    // Draw too close warning
+                    if (det.too_close) {
+                        ctx.fillStyle = '#EF4444';
+                        ctx.font = 'bold 16px Arial';
+                        ctx.fillText('⚠️ ' + getTranslation('object_too_close'), x1, y1 - 25);
+                    }
+                });
+            }
+
+            // Handle object too close warning
+            function handleTooCloseWarning(detections) {
+                const tooClose = detections.some(d => d.too_close);
+                
+                if (tooClose) {
+                    cameraContainer.classList.add('warning-border');
+                    statusIndicator.classList.add('blink-warning');
+                    statusIndicator.textContent = `⚠️ ${getTranslation('object_too_close')}`;
+                } else {
+                    cameraContainer.classList.remove('warning-border');
+                    statusIndicator.classList.remove('blink-warning');
+                    statusIndicator.textContent = `${getTranslation('status')}: Active`;
+                }
+            }
+
+            // Update detection UI
+            function updateDetectionUI(data) {
+                if (data.detections.length > 0) {
+                    const detectionText = data.detections.map(d => {
+                        let text = `${d.label} (${d.direction}, ${d.distance}m`;
+                        if (d.movement === 'moving') text += ' →';
+                        if (d.too_close) text = `⚠️ ${text}`;
+                        return text;
+                    }).join(', ');
+                    audioOutput.textContent = `Detected: ${detectionText}`;
+                } else {
+                    audioOutput.textContent = getTranslation('environment_clear');
+                }
+                
+                statusIndicator.textContent = `${getTranslation('status')}: Active | FPS: ${data.fps.toFixed(1)} | Objects: ${data.detections.length}`;
+            }
+
+            // Fetch detection history
+            async function fetchDetectionHistory() {
+                try {
+                    const response = await fetch(HISTORY_URL);
+                    if (!response.ok) throw new Error('Failed to fetch history');
+                    const history = await response.json();
+                    
+                    // Update history table
+                    historyBody.innerHTML = '';
+                    history.forEach(entry => {
+                        const row = document.createElement('tr');
+                        row.className = 'border-b border-gray-700';
+                        if (entry.too_close) {
+                            row.classList.add('bg-red-900');
+                        }
+                        row.innerHTML = `
+                            <td class="p-2">${entry.time}</td>
+                            <td class="p-2">${entry.object}</td>
+                            <td class="p-2">${entry.distance}m</td>
+                            <td class="p-2">${entry.direction}</td>
+                            <td class="p-2">${entry.movement}</td>
+                        `;
+                        historyBody.appendChild(row);
+                    });
+                } catch (err) {
+                    console.error('History error:', err);
+                }
+            }
+
+            // Update system stats
+            async function updateSystemStats() {
+                try {
+                    const response = await fetch(SYSTEM_URL);
+                    if (!response.ok) throw new Error('Failed to fetch system stats');
+                    const stats = await response.json();
+                    sysCPU.textContent = `${stats.cpu}%`;
+                    sysMem.textContent = `${stats.memory}%`;
+                } catch (err) {
+                    console.error('System stats error:', err);
+                }
+            }
+
+            // Save history
+            async function saveHistory() {
+                try {
+                    const response = await fetch(SAVE_HISTORY_URL, { method: 'POST' });
+                    const result = await response.json();
+                    if (result.status === 'success') {
+                        alert(getTranslation('history_saved'));
+                    } else {
+                        alert('Failed to save history');
+                    }
+                } catch (err) {
+                    console.error('Save history error:', err);
+                    alert('Error saving history');
+                }
+            }
+
+            // Download history
+            function downloadHistory() {
+                window.location.href = DOWNLOAD_HISTORY_URL;
+            }
+
+            // Clear history
+            async function clearHistory() {
+                if (confirm('Are you sure you want to clear the history?')) {
+                    try {
+                        const response = await fetch(CLEAR_HISTORY_URL, { method: 'POST' });
+                        if (response.ok) {
+                            fetchDetectionHistory();
+                        }
+                    } catch (err) {
+                        console.error('Clear history error:', err);
+                    }
+                }
+            }
+
+            // Speak alert using browser's SpeechSynthesis API
+            function speakAlert(text) {
+                if (!voiceEnabled || !text) return;
+                
+                try {
+                    const utterance = new SpeechSynthesisUtterance(text);
+                    utterance.rate = 1.0;
+                    utterance.pitch = 1.0;
+                    utterance.lang = currentLanguage;
+                    speechSynthesis.speak(utterance);
+                } catch (e) {
+                    console.error('Speech synthesis error:', e);
+                    audioOutput.textContent = "Voice error: " + e.message;
+                }
+            }
+
+            // Play audio alert
+            function playAudioAlert(data) {
+                if (!voiceEnabled || !data.audio_text) return;
+                
+                const currentTime = Date.now();
+                if (currentTime - lastAudioTime < AUDIO_COOLDOWN) return;
+                
+                // Update audio output
+                audioOutput.textContent = data.audio_text;
+                
+                // Speak the alert
+                speakAlert(data.audio_text);
+                lastAudioTime = currentTime;
+            }
+
+            // Initialize on load
+            window.addEventListener('load', init);
+        </script>
+    </body>
+    </html>
+    """
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    debug_mode = os.environ.get('DEBUG', 'false').lower() == 'true'
+    app.run(host='0.0.0.0', port=port, debug=debug_mode, threaded=True)
